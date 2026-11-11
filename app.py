@@ -161,10 +161,18 @@ def assign_case(case_id):
     }
 
     if hospital_id:
-        hospital = hospitals.find_one({"hospital_id": hospital_id})
+        hospital = hospitals.find_one({
+            "$or": [
+                {"hospital_id": hospital_id},
+                {"name": hospital_id},
+            ]
+        })
+
         if hospital is None:
             return jsonify({"error": "Hospital not found"}), 404
-        update["hospital_id"] = hospital_id
+
+        # Store the stable ID when present; otherwise use the hospital name.
+        update["hospital_id"] = hospital.get("hospital_id") or hospital["name"]
 
     cases.update_one({"case_id": case_id}, {"$set": update})
     ambulances.update_one(
@@ -231,6 +239,65 @@ def update_case_status(case_id):
 
     updated_case = cases.find_one({"case_id": case_id}, {"_id": 0})
     return jsonify(updated_case)
+@app.get("/api/cases/<case_id>/recommend-hospital")
+def recommend_hospital(case_id):
+    case = cases.find_one({"case_id": case_id}, {"_id": 0})
+
+    if case is None:
+        return jsonify({"error": "Case not found"}), 404
+
+    symptoms = case.get("symptoms", [])
+    if isinstance(symptoms, str):
+        symptoms = [symptoms]
+    symptoms = [str(symptom).lower() for symptom in symptoms]
+
+    # Simple project demo rule, not medical diagnosis.
+    required_facility = "general"
+
+    if any("chest" in symptom or "heart" in symptom for symptom in symptoms):
+        required_facility = "cardiac"
+    elif any("injury" in symptom or "accident" in symptom for symptom in symptoms):
+        required_facility = "trauma"
+    elif any("breath" in symptom or "respiratory" in symptom for symptom in symptoms):
+        required_facility = "respiratory"
+
+    candidates = list(hospitals.find(
+        {"facilities": required_facility},
+        {"_id": 0},
+    ))
+
+    # Accept either field name used by the two demo data formats.
+    candidates = [
+        hospital for hospital in candidates
+        if hospital.get("accepting", hospital.get("available", False))
+    ]
+
+    if not candidates:
+        return jsonify({
+            "case_id": case_id,
+            "required_facility": required_facility,
+            "recommendation": None,
+            "message": "No accepting demo hospital lists this facility.",
+            "note": "This is a demo matching rule, not medical advice.",
+        }), 200
+
+    candidates.sort(
+        key=lambda hospital: hospital.get("demo_eta_minutes", 9999)
+    )
+    selected = candidates[0]
+    selected_id = selected.get("hospital_id") or selected.get("name")
+
+    cases.update_one(
+        {"case_id": case_id},
+        {"$set": {"hospital_id": selected_id}},
+    )
+
+    return jsonify({
+        "case_id": case_id,
+        "required_facility": required_facility,
+        "recommendation": selected,
+        "note": "This is a demo matching rule, not medical advice.",
+    })
 if __name__ == "__main__":
     seed_demo_data()
     app.run(debug=True)
