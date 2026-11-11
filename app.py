@@ -134,7 +134,103 @@ def list_ambulances():
     results = list(ambulances.find({}, {"_id": 0}))
     return jsonify(results)
 
+@app.patch("/api/cases/<case_id>/assign")
+def assign_case(case_id):
+    data = request.get_json(silent=True) or {}
+    ambulance_id = data.get("ambulance_id")
+    hospital_id = data.get("hospital_id")
 
+    if not ambulance_id:
+        return jsonify({"error": "ambulance_id is required"}), 400
+
+    case = cases.find_one({"case_id": case_id})
+    if case is None:
+        return jsonify({"error": "Case not found"}), 404
+
+    ambulance = ambulances.find_one({
+        "ambulance_id": ambulance_id,
+        "status": "available",
+    })
+    if ambulance is None:
+        return jsonify({"error": "Available ambulance not found"}), 404
+
+    update = {
+        "ambulance_id": ambulance_id,
+        "case_status": "assigned",
+        "route_stage": "Ambulance assigned",
+    }
+
+    if hospital_id:
+        hospital = hospitals.find_one({"hospital_id": hospital_id})
+        if hospital is None:
+            return jsonify({"error": "Hospital not found"}), 404
+        update["hospital_id"] = hospital_id
+
+    cases.update_one({"case_id": case_id}, {"$set": update})
+    ambulances.update_one(
+        {"ambulance_id": ambulance_id},
+        {"$set": {"status": "assigned", "case_id": case_id}},
+    )
+
+    updated_case = cases.find_one({"case_id": case_id}, {"_id": 0})
+    return jsonify(updated_case)
+
+
+@app.patch("/api/cases/<case_id>/location")
+def update_location(case_id):
+    data = request.get_json(silent=True) or {}
+    latitude = data.get("latitude")
+    longitude = data.get("longitude")
+
+    if latitude is None or longitude is None:
+        return jsonify({"error": "latitude and longitude are required"}), 400
+
+    result = cases.update_one(
+        {"case_id": case_id},
+        {"$set": {
+            "ambulance_latitude": latitude,
+            "ambulance_longitude": longitude,
+        }},
+    )
+
+    if result.matched_count == 0:
+        return jsonify({"error": "Case not found"}), 404
+
+    updated_case = cases.find_one({"case_id": case_id}, {"_id": 0})
+    return jsonify(updated_case)
+
+
+@app.patch("/api/cases/<case_id>/status")
+def update_case_status(case_id):
+    data = request.get_json(silent=True) or {}
+    status = data.get("case_status")
+
+    allowed_statuses = [
+        "requested",
+        "assigned",
+        "en_route",
+        "at_scene",
+        "transporting",
+        "arrived",
+        "completed",
+    ]
+
+    if status not in allowed_statuses:
+        return jsonify({
+            "error": "Invalid case_status",
+            "allowed_statuses": allowed_statuses,
+        }), 400
+
+    result = cases.update_one(
+        {"case_id": case_id},
+        {"$set": {"case_status": status}},
+    )
+
+    if result.matched_count == 0:
+        return jsonify({"error": "Case not found"}), 404
+
+    updated_case = cases.find_one({"case_id": case_id}, {"_id": 0})
+    return jsonify(updated_case)
 if __name__ == "__main__":
     seed_demo_data()
     app.run(debug=True)
