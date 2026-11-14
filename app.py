@@ -14,6 +14,26 @@ hospitals = db["hospitals"]
 ambulances = db["ambulances"]
 
 
+def calculate_demo_risk(symptoms):
+    """Keyword based demo flag; it is not a medical assessment."""
+    if isinstance(symptoms, str):
+        symptoms = [symptoms]
+    text = " ".join(str(item).lower() for item in symptoms)
+    if any(word in text for word in ("chest pain", "unconscious", "severe bleeding", "not breathing")):
+        return "High (demo)"
+    if any(word in text for word in ("breath", "injury", "accident", "pain")):
+        return "Moderate (demo)"
+    return "Low (demo)"
+
+
+def hospital_available(hospital):
+    return hospital.get("accepting", hospital.get("available", False)) is True
+
+
+def find_hospital(identifier):
+    return hospitals.find_one({"$or": [{"hospital_id": identifier}, {"name": identifier}]})
+
+
 def seed_demo_data():
     if hospitals.count_documents({}) == 0:
         hospitals.insert_many([
@@ -88,7 +108,7 @@ def create_case():
         "patient_name": data["patient_name"],
         "caller_name": data["caller_name"],
         "symptoms": data["symptoms"],
-        "risk_level": "Needs review",
+        "risk_level": calculate_demo_risk(data["symptoms"]),
         "pickup_latitude": data.get("pickup_latitude"),
         "pickup_longitude": data.get("pickup_longitude"),
         "hospital_id": None,
@@ -99,6 +119,7 @@ def create_case():
         "eta_minutes": None,
         "ambulance_latitude": None,
         "ambulance_longitude": None,
+        "signal_priority": "inactive",
         "created_at": datetime.now(timezone.utc),
     }
 
@@ -193,7 +214,17 @@ def update_location(case_id):
     if latitude is None or longitude is None:
         return jsonify({"error": "latitude and longitude are required"}), 400
 
-    result = cases.update_one(
+    if not isinstance(latitude, (int, float)) or not isinstance(longitude, (int, float)):
+        return jsonify({"error": "coordinates must be numbers"}), 400
+
+    if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+        return jsonify({"error": "coordinates are outside valid ranges"}), 400
+
+    case = cases.find_one({"case_id": case_id})
+    if case is None:
+        return jsonify({"error": "Case not found"}), 404
+
+    cases.update_one(
         {"case_id": case_id},
         {"$set": {
             "ambulance_latitude": latitude,
@@ -201,41 +232,57 @@ def update_location(case_id):
         }},
     )
 
-    if result.matched_count == 0:
-        return jsonify({"error": "Case not found"}), 404
+    # Keep the ambulance's own location record in sync as well.
+    if case.get("ambulance_id"):
+        ambulances.update_one(
+            {"ambulance_id": case["ambulance_id"]},
+            {"$set": {
+                "latitude": latitude,
+                "longitude": longitude,
+            }},
+        )
 
     updated_case = cases.find_one({"case_id": case_id}, {"_id": 0})
     return jsonify(updated_case)
-
-
 @app.patch("/api/cases/<case_id>/status")
 def update_case_status(case_id):
     data = request.get_json(silent=True) or {}
     status = data.get("case_status")
 
-    allowed_statuses = [
-        "requested",
-        "assigned",
-        "en_route",
-        "at_scene",
-        "transporting",
-        "arrived",
-        "completed",
-    ]
+    route_stages = {
+        "requested": "Waiting for ambulance",
+        "assigned": "Ambulance assigned",
+        "en_route": "Ambulance en route",
+        "at_scene": "Ambulance at pickup",
+        "transporting": "Transporting to hospital",
+        "arrived": "Arrived at hospital",
+        "completed": "Case completed",
+    }
 
-    if status not in allowed_statuses:
+    if status not in route_stages:
         return jsonify({
             "error": "Invalid case_status",
-            "allowed_statuses": allowed_statuses,
+            "allowed_statuses": list(route_stages.keys()),
         }), 400
 
     result = cases.update_one(
         {"case_id": case_id},
-        {"$set": {"case_status": status}},
+        {"$set": {
+            "case_status": status,
+            "route_stage": route_stages[status],
+        }},
     )
 
     if result.matched_count == 0:
         return jsonify({"error": "Case not found"}), 404
+
+    if status == "completed":
+        case = cases.find_one({"case_id": case_id})
+        if case and case.get("ambulance_id"):
+            ambulances.update_one(
+                {"ambulance_id": case["ambulance_id"]},
+                {"$set": {"status": "available", "case_id": None}},
+            )
 
     updated_case = cases.find_one({"case_id": case_id}, {"_id": 0})
     return jsonify(updated_case)
@@ -298,6 +345,48 @@ def recommend_hospital(case_id):
         "recommendation": selected,
         "note": "This is a demo matching rule, not medical advice.",
     })
+@app.patch("/api/cases/<case_id>/route")
+def update_route(case_id):
+    data = request.get_json(silent=True) or {}
+
+    traffic_delays = {
+        "Clear": 0,
+        "Moderate": 5,
+        "Heavy": 12,
+    }
+
+    traffic = data.get("traffic_level", "Clear")
+    if traffic not in traffic_delays:
+        return jsonify({
+            "error": "traffic_level must be Clear, Moderate, or Heavy"
+        }), 400
+
+    base_eta = data.get("base_eta_minutes", 10)
+    if not isinstance(base_eta, (int, float)) or base_eta < 0:
+        return jsonify({"error": "base_eta_minutes must be a non-negative number"}), 400
+
+    case = cases.find_one({"case_id": case_id})
+    if case is None:
+        return jsonify({"error": "Case not found"}), 404
+
+    update = {
+        "traffic_level": traffic,
+        "eta_minutes": int(base_eta + traffic_delays[traffic]),
+    }
+
+    if "route_stage" in data:
+        update["route_stage"] = data["route_stage"]
+
+    if "signal_priority" in data:
+        if data["signal_priority"] not in ["active", "inactive"]:
+            return jsonify({
+                "error": "signal_priority must be active or inactive"
+            }), 400
+        update["signal_priority"] = data["signal_priority"]
+
+    cases.update_one({"case_id": case_id}, {"$set": update})
+    updated_case = cases.find_one({"case_id": case_id}, {"_id": 0})
+    return jsonify(updated_case)
 if __name__ == "__main__":
     seed_demo_data()
     app.run(debug=True)
