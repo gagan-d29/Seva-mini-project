@@ -1,7 +1,9 @@
+import os
+import requests
+
 from datetime import datetime, timezone
 from uuid import uuid4
-
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, render_template
 from pymongo import MongoClient
 
 app = Flask(__name__)
@@ -387,6 +389,160 @@ def update_route(case_id):
     cases.update_one({"case_id": case_id}, {"$set": update})
     updated_case = cases.find_one({"case_id": case_id}, {"_id": 0})
     return jsonify(updated_case)
+@app.get("/api/routes")
+def list_api_routes():
+    routes = []
+
+    for rule in app.url_map.iter_rules():
+        path = str(rule)
+        if path.startswith("/api/"):
+            methods = sorted(rule.methods - {"HEAD", "OPTIONS"})
+            routes.append({
+                "path": path,
+                "methods": methods,
+            })
+
+    return jsonify(routes)
+@app.get("/api/cases/<case_id>/live-route")
+def get_live_route(case_id):
+    api_key = os.getenv("TOMTOM_API_KEY")
+    if not api_key:
+        return jsonify({"error": "TOMTOM_API_KEY is not set"}), 500
+
+    case = cases.find_one({"case_id": case_id})
+    if case is None:
+        return jsonify({"error": "Case not found"}), 404
+
+    ambulance_id = case.get("ambulance_id")
+    ambulance = (
+        ambulances.find_one({"ambulance_id": ambulance_id})
+        if ambulance_id else None
+    )
+
+    # Prefer the latest coordinates saved on the case.
+    origin_lat = case.get("ambulance_latitude")
+    origin_lon = case.get("ambulance_longitude")
+
+    # If the case has no location yet, use the ambulance record.
+    if origin_lat is None or origin_lon is None:
+        origin_lat = (ambulance or {}).get("latitude")
+        origin_lon = (ambulance or {}).get("longitude")
+
+    destination_type = request.args.get("destination", "hospital")
+
+    if destination_type == "scene":
+        destination_lat = case.get("pickup_latitude")
+        destination_lon = case.get("pickup_longitude")
+
+    elif destination_type == "hospital":
+        hospital_id = case.get("hospital_id")
+        if not hospital_id:
+            return jsonify({"error": "Recommend or assign a hospital first"}), 400
+
+        hospital = find_hospital(hospital_id)
+        if hospital is None:
+            return jsonify({"error": "Hospital record not found"}), 404
+
+        destination_lat = hospital.get("latitude")
+        destination_lon = hospital.get("longitude")
+
+    else:
+        return jsonify({
+            "error": "destination must be scene or hospital"
+        }), 400
+
+    if any(value is None for value in (
+        origin_lat, origin_lon, destination_lat, destination_lon
+    )):
+        return jsonify({
+            "error": "Ambulance and selected destination need latitude and longitude"
+        }), 400
+
+    url = "https://api.tomtom.com/maps/orbis/routing/routes/calculate"
+    headers = {
+        "Content-Type": "application/json",
+        "TomTom-Api-Version": "3",
+        "TomTom-Api-Key": api_key,
+        "Attributes": "routes.summary,routes.legs.path",
+    }
+    body = {
+        "routePlanningLocations": {
+            "origin": {
+                "type": "Point",
+                "coordinates": [origin_lon, origin_lat],
+            },
+            "destination": {
+                "type": "Point",
+                "coordinates": [destination_lon, destination_lat],
+            },
+        },
+        "traffic": "live",
+        "routeType": "fast",
+    }
+
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            json=body,
+            timeout=20,
+        )
+        response.raise_for_status()
+        tomtom_data = response.json()
+    except requests.RequestException as error:
+        return jsonify({
+            "error": "TomTom route request failed",
+            "details": str(error),
+        }), 502
+
+    routes = tomtom_data.get("routes", [])
+    if not routes:
+        return jsonify({"error": "TomTom returned no route"}), 502
+
+    route = routes[0]
+    summary = route.get("summary", {})
+    coordinates = []
+
+    for leg in route.get("legs", []):
+        coordinates.extend(leg.get("path", {}).get("coordinates", []))
+
+    eta_seconds = summary.get("travelDurationInSeconds")
+    if eta_seconds is None:
+        return jsonify({
+            "error": "TomTom response did not include route duration"
+        }), 502
+
+    delay_seconds = summary.get("trafficDelayDurationInSeconds", 0)
+
+    if delay_seconds < 60:
+        traffic_level = "Clear"
+    elif delay_seconds < 300:
+        traffic_level = "Moderate"
+    else:
+        traffic_level = "Heavy"
+
+    update = {
+        "eta_minutes": round(eta_seconds / 60),
+        "traffic_level": traffic_level,
+        "traffic_delay_minutes": round(delay_seconds / 60, 1),
+        "route_distance_meters": summary.get("lengthInMeters"),
+        "route_geometry": {
+            "type": "LineString",
+            "coordinates": coordinates,
+        },
+        "route_source": "TomTom live traffic",
+        "route_destination": destination_type,
+    }
+
+    cases.update_one(
+        {"case_id": case_id},
+        {"$set": update},
+    )
+
+    return jsonify({
+        "case_id": case_id,
+        **update,
+    })
 if __name__ == "__main__":
     seed_demo_data()
     app.run(debug=True)
