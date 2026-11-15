@@ -1,10 +1,10 @@
 import os
 import requests
-
+from pymongo import MongoClient,ReturnDocument
 from datetime import datetime, timezone
 from uuid import uuid4
 from flask import Flask, jsonify, request, render_template
-from pymongo import MongoClient
+
 
 app = Flask(__name__)
 
@@ -26,7 +26,14 @@ def calculate_demo_risk(symptoms):
     if any(word in text for word in ("breath", "injury", "accident", "pain")):
         return "Moderate (demo)"
     return "Low (demo)"
-
+def generate_case_id():
+    counter = db["counters"].find_one_and_update(
+        {"_id": "case_id"},
+        {"$inc": {"sequence": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return f"SEVA-{counter['sequence']:04d}"
 
 def hospital_available(hospital):
     return hospital.get("accepting", hospital.get("available", False)) is True
@@ -37,45 +44,93 @@ def find_hospital(identifier):
 
 
 def seed_demo_data():
-    if hospitals.count_documents({}) == 0:
-        hospitals.insert_many([
-            {
-                "hospital_id": "H001",
-                "name": "Central General Hospital",
-                "latitude": 12.9750,
-                "longitude": 77.6050,
-                "facilities": ["emergency", "cardiac", "icu"],
-                "available": True,
-            },
-            {
-                "hospital_id": "H002",
-                "name": "Southside Medical Centre",
-                "latitude": 12.9400,
-                "longitude": 77.5900,
-                "facilities": ["emergency", "trauma"],
-                "available": True,
-            },
-        ])
+    hospital_records = [
+        {
+            "hospital_id": "H001",
+            "name": "A.J. Hospital & Research Centre",
+            "latitude": 12.903178,
+            "longitude": 74.845365,
+            "facilities": ["general", "emergency", "trauma", "cardiac", "respiratory", "icu"],
+            "accepting": True,
+            "available": True,
+            "capacity": "Demo available",
+            "demo_eta_minutes": 12,
+        },
+        {
+            "hospital_id": "H002",
+            "name": "Father Muller Medical College Hospital",
+            "latitude": 12.86721,
+            "longitude": 74.86075,
+            "facilities": ["general", "emergency", "trauma", "respiratory", "icu"],
+            "accepting": True,
+            "available": True,
+            "capacity": "Demo available",
+            "demo_eta_minutes": 8,
+        },
+        {
+            "hospital_id": "H003",
+            "name": "KMC Hospital, Mangaluru",
+            "latitude": 12.8719,
+            "longitude": 74.8483,
+            "facilities": ["general", "emergency", "trauma", "cardiac", "icu"],
+            "accepting": True,
+            "available": True,
+            "capacity": "Demo available",
+            "demo_eta_minutes": 6,
+        },
+    ]
+    old_hospital_names = {
+        "H001": ["Central General Hospital", "Sahyadri Demo Hospital"],
+        "H002": ["Southside Medical Centre", "City General Demo Hospital"],
+        "H003": ["Community Demo Clinic"],
+    }
 
-    if ambulances.count_documents({}) == 0:
-        ambulances.insert_many([
+    # Update known demo records as well as inserting missing ones. The old
+    # seed only ran for an empty collection, leaving earlier city data in MongoDB.
+    for hospital in hospital_records:
+        match = hospitals.find_one({
+            "$or": [
+                {"hospital_id": hospital["hospital_id"]},
+                {"name": {"$in": old_hospital_names[hospital["hospital_id"]] + [hospital["name"]]}},
+            ]
+        })
+        if match:
+            hospitals.update_one({"_id": match["_id"]}, {"$set": hospital})
+        else:
+            hospitals.insert_one(hospital)
+
+    ambulance_records = [
+        {"ambulance_id": "A001", "name": "Mangaluru Demo Ambulance 1", "latitude": 12.872, "longitude": 74.849},
+        {"ambulance_id": "A002", "name": "Mangaluru Demo Ambulance 2", "latitude": 12.879, "longitude": 74.856},
+    ]
+    for ambulance in ambulance_records:
+        ambulances.update_one(
+            {"ambulance_id": ambulance["ambulance_id"]},
             {
-                "ambulance_id": "A001",
-                "name": "Demo Ambulance 1",
-                "status": "available",
-                "latitude": 12.9716,
-                "longitude": 77.5946,
-                "case_id": None,
+                "$set": {
+                    "name": ambulance["name"],
+                    "latitude": ambulance["latitude"],
+                    "longitude": ambulance["longitude"],
+                },
+                "$setOnInsert": {"status": "available", "case_id": None},
             },
-            {
-                "ambulance_id": "A002",
-                "name": "Demo Ambulance 2",
-                "status": "available",
-                "latitude": 12.9500,
-                "longitude": 77.6000,
-                "case_id": None,
+            upsert=True,
+        )
+
+    # Keep the current walkthrough case in the same Mangaluru demo area.
+    # Hospital recommendation should be run again after the seed names change.
+    cases.update_one(
+        {"case_id": "SEVA-0002"},
+        {
+            "$set": {
+                "pickup_latitude": 12.879,
+                "pickup_longitude": 74.856,
+                "ambulance_latitude": 12.872,
+                "ambulance_longitude": 74.849,
             },
-        ])
+            "$unset": {"hospital_id": ""},
+        },
+    )
 
 
 @app.get("/")
@@ -91,7 +146,29 @@ def health():
     except Exception as error:
         return jsonify({"status": "error", "message": str(error)}), 500
 
+def classify_risk(symptoms):
+    if isinstance(symptoms, str):
+        symptoms = [symptoms]
 
+    symptoms_text = " ".join(symptoms).lower()
+
+    high_risk_terms = [
+        "breathing difficulty",
+        "unconscious",
+        "severe bleeding",
+        "chest pain",
+    ]
+    medium_risk_terms = [
+        "high fever",
+        "serious injury",
+        "persistent vomiting",
+    ]
+
+    if any(term in symptoms_text for term in high_risk_terms):
+        return "High"
+    if any(term in symptoms_text for term in medium_risk_terms):
+        return "Medium"
+    return "Low"
 @app.post("/api/cases")
 def create_case():
     data = request.get_json(silent=True) or {}
@@ -106,11 +183,11 @@ def create_case():
         }), 400
 
     case = {
-        "case_id": str(uuid4()),
+        "case_id": generate_case_id(),
         "patient_name": data["patient_name"],
         "caller_name": data["caller_name"],
         "symptoms": data["symptoms"],
-        "risk_level": calculate_demo_risk(data["symptoms"]),
+       "risk_level": classify_risk(data["symptoms"]),
         "pickup_latitude": data.get("pickup_latitude"),
         "pickup_longitude": data.get("pickup_longitude"),
         "hospital_id": None,
@@ -272,6 +349,9 @@ def update_case_status(case_id):
         {"$set": {
             "case_status": status,
             "route_stage": route_stages[status],
+            "signal_priority": (
+                "active" if status in {"en_route", "transporting"} else "inactive"
+            ),
         }},
     )
 
@@ -405,9 +485,9 @@ def list_api_routes():
     return jsonify(routes)
 @app.get("/api/cases/<case_id>/live-route")
 def get_live_route(case_id):
-    api_key = os.getenv("TOMTOM_API_KEY")
+    api_key = os.getenv("ORS_API_KEY")
     if not api_key:
-        return jsonify({"error": "TOMTOM_API_KEY is not set"}), 500
+        return jsonify({"error": "ORS_API_KEY is not set"}), 500
 
     case = cases.find_one({"case_id": case_id})
     if case is None:
@@ -458,91 +538,65 @@ def get_live_route(case_id):
             "error": "Ambulance and selected destination need latitude and longitude"
         }), 400
 
-    url = "https://api.tomtom.com/maps/orbis/routing/routes/calculate"
+    url = (
+        "https://api.heigit.org/"
+        "openrouteservice/v2/directions/driving-car/geojson"
+    )
     headers = {
+        "Authorization": api_key,
         "Content-Type": "application/json",
-        "TomTom-Api-Version": "3",
-        "TomTom-Api-Key": api_key,
-        "Attributes": "routes.summary,routes.legs.path",
     }
     body = {
-        "routePlanningLocations": {
-            "origin": {
-                "type": "Point",
-                "coordinates": [origin_lon, origin_lat],
-            },
-            "destination": {
-                "type": "Point",
-                "coordinates": [destination_lon, destination_lat],
-            },
-        },
-        "traffic": "live",
-        "routeType": "fast",
+        # ORS expects [longitude, latitude].
+        "coordinates": [
+            [origin_lon, origin_lat],
+            [destination_lon, destination_lat],
+        ],
+        "instructions": False,
     }
 
     try:
-        response = requests.post(
-            url,
-            headers=headers,
-            json=body,
-            timeout=20,
-        )
+        response = requests.post(url, headers=headers, json=body, timeout=20)
         response.raise_for_status()
-        tomtom_data = response.json()
+        ors_data = response.json()
     except requests.RequestException as error:
+        details = error.response.text if error.response is not None else str(error)
         return jsonify({
-            "error": "TomTom route request failed",
-            "details": str(error),
+            "error": "ORS route request failed",
+            "details": details,
         }), 502
 
-    routes = tomtom_data.get("routes", [])
-    if not routes:
-        return jsonify({"error": "TomTom returned no route"}), 502
+    features = ors_data.get("features", [])
+    if not features:
+        return jsonify({"error": "ORS returned no route"}), 502
 
-    route = routes[0]
-    summary = route.get("summary", {})
-    coordinates = []
+    route = features[0]
+    summary = route.get("properties", {}).get("summary", {})
+    duration_seconds = summary.get("duration")
+    distance_meters = summary.get("distance")
 
-    for leg in route.get("legs", []):
-        coordinates.extend(leg.get("path", {}).get("coordinates", []))
-
-    eta_seconds = summary.get("travelDurationInSeconds")
-    if eta_seconds is None:
-        return jsonify({
-            "error": "TomTom response did not include route duration"
-        }), 502
-
-    delay_seconds = summary.get("trafficDelayDurationInSeconds", 0)
-
-    if delay_seconds < 60:
-        traffic_level = "Clear"
-    elif delay_seconds < 300:
-        traffic_level = "Moderate"
-    else:
-        traffic_level = "Heavy"
+    if duration_seconds is None or distance_meters is None:
+        return jsonify({"error": "ORS response is missing route distance or duration"}), 502
 
     update = {
-        "eta_minutes": round(eta_seconds / 60),
-        "traffic_level": traffic_level,
-        "traffic_delay_minutes": round(delay_seconds / 60, 1),
-        "route_distance_meters": summary.get("lengthInMeters"),
-        "route_geometry": {
-            "type": "LineString",
-            "coordinates": coordinates,
-        },
-        "route_source": "TomTom live traffic",
+        "eta_minutes": round(duration_seconds / 60),
+        "traffic_level": "Not provided by ORS",
+        "traffic_delay_minutes": 0,
+        "route_distance_meters": distance_meters,
+        "route_geometry": route.get("geometry"),
+        "route_source": "ORS route estimate; no live traffic",
         "route_destination": destination_type,
     }
 
-    cases.update_one(
-        {"case_id": case_id},
-        {"$set": update},
-    )
+    cases.update_one({"case_id": case_id}, {"$set": update})
 
     return jsonify({
         "case_id": case_id,
         **update,
     })
+@app.get("/ambulance")
+def ambulance_page():
+    return render_template("ambulance.html")
 if __name__ == "__main__":
     seed_demo_data()
     app.run(debug=True)

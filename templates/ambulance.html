@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>SEVA Ambulance Tracking</title>
+
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+
+        #map {
+            height: 65vh;
+            min-height: 400px;
+            margin-top: 16px;
+        }
+
+        input,
+        select,
+        button {
+            padding: 9px;
+            margin: 4px;
+        }
+
+        #message {
+            margin-top: 12px;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>SEVA Ambulance Tracking</h1>
+
+    <label for="caseId">Case ID</label>
+    <input id="caseId" value="SEVA-0002" size="38">
+
+    <label for="destination">Route to</label>
+    <select id="destination">
+        <option value="scene">Pickup scene</option>
+        <option value="hospital" selected>Hospital</option>
+    </select>
+
+    <button id="gpsButton">Start GPS</button>
+    <button id="simulateButton">Start demo movement</button>
+    <button id="routeButton">Refresh traffic route</button>
+
+    <div id="message">Enter a case ID, then start GPS or load its route.</div>
+    <div>
+        Route stage: <span id="routeStage">Waiting for ambulance</span>
+        &nbsp;|&nbsp;
+        Signal priority: <span id="signalPriority">Inactive (simulated)</span>
+    </div>
+    <div id="map"></div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        const map = L.map("map").setView([12.872, 74.849], 13);
+
+        L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+            maxZoom: 19,
+            attribution: "&copy; OpenStreetMap contributors"
+        }).addTo(map);
+
+        let ambulanceMarker = null;
+        let destinationMarker = null;
+        let routeLayer = null;
+        let watchId = null;
+        let simulationTimer = null;
+        let simulationPoints = [];
+        let simulationIndex = 0;
+        let lastLocationSentAt = 0;
+
+        const caseIdInput = document.getElementById("caseId");
+        const message = document.getElementById("message");
+    async function updateCaseStatus(status) {
+        const caseId = caseIdInput.value.trim();
+
+        const response = await fetch(
+            `/api/cases/${encodeURIComponent(caseId)}/status`,
+            {
+                method: "PATCH",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ case_status: status })
+            }
+        );
+
+        const result = await response.json();
+        if (!response.ok) {
+            throw new Error(result.error || "Could not update case status");
+        }
+
+        document.getElementById("routeStage").textContent = result.route_stage;
+        document.getElementById("signalPriority").textContent =
+            result.signal_priority === "active"
+                ? "Active (simulated)"
+                : "Inactive (simulated)";
+    }
+        async function refreshRoute() {
+            const caseId = caseIdInput.value.trim();
+            const destination = document.getElementById("destination").value;
+
+            if (!caseId) {
+                message.textContent = "Enter a case ID first.";
+                return;
+            }
+
+            message.textContent = "Requesting traffic-aware route…";
+
+            try {
+                const response = await fetch(
+                    `/api/cases/${encodeURIComponent(caseId)}/live-route?destination=${destination}`
+                );
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(data.error || "Could not load route");
+                }
+
+                if (routeLayer) {
+                    map.removeLayer(routeLayer);
+                }
+
+                // GeoJSON coordinates are [longitude, latitude].
+                // Leaflet's GeoJSON layer converts them correctly.
+                routeLayer = L.geoJSON(data.route_geometry, {
+                    style: { color: "#1769aa", weight: 6 }
+                }).addTo(map);
+                const geometry = data.route_geometry.type === "Feature"
+                    ? data.route_geometry.geometry
+                    : data.route_geometry;
+
+                const coordinates = geometry.coordinates;
+                const stride = Math.max(1, Math.floor(coordinates.length / 25));
+
+                simulationPoints = coordinates
+                    .filter((_, index) => index % stride === 0)
+                    .map(([longitude, latitude]) => [latitude, longitude]);
+
+                const lastCoordinate = coordinates[coordinates.length - 1];
+                const lastPoint = [lastCoordinate[1], lastCoordinate[0]];
+                if (destinationMarker) {
+                    map.removeLayer(destinationMarker);
+                }
+
+                const destinationLabel =
+                    destination === "scene" ? "Patient pickup location" : "Selected hospital";
+
+                destinationMarker = L.marker(lastPoint)
+                    .addTo(map)
+                    .bindPopup(destinationLabel);
+                if (simulationPoints.length > 0) {
+                    simulationPoints.push(lastPoint);
+                }
+                map.fitBounds(routeLayer.getBounds(), { padding: [25, 25] });
+
+                message.textContent =
+                    `ETA: ${data.eta_minutes} min | ` +
+                    `Traffic: ${data.traffic_level} | ` +
+                    `Delay: ${data.traffic_delay_minutes} min`;
+            } catch (error) {
+                message.textContent = error.message;
+            }
+        }
+
+        async function sendLocation(position) {
+            const now = Date.now();
+
+            // Limit database updates to at most one every 5 seconds.
+            if (now - lastLocationSentAt < 5000) return;
+            lastLocationSentAt = now;
+
+            const caseId = caseIdInput.value.trim();
+            const latitude = position.coords.latitude;
+            const longitude = position.coords.longitude;
+
+            if (ambulanceMarker) {
+                ambulanceMarker.setLatLng([latitude, longitude]);
+            } else {
+                ambulanceMarker = L.marker([latitude, longitude])
+                    .addTo(map)
+                    .bindPopup("Ambulance");
+            }
+
+            map.setView([latitude, longitude], 16);
+
+            try {
+                const response = await fetch(
+                    `/api/cases/${encodeURIComponent(caseId)}/location`,
+                    {
+                        method: "PATCH",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ latitude, longitude })
+                    }
+                );
+
+                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data.error || "Location update failed");
+                }
+
+                message.textContent =
+                    `Location sent: ${latitude.toFixed(5)}, ${longitude.toFixed(5)}. ` +
+                    `Press “Refresh traffic route” to recalculate the route.`;
+            } catch (error) {
+                message.textContent = error.message;
+            }
+        }
+
+        document.getElementById("gpsButton").addEventListener("click", async () => {
+            if (!navigator.geolocation) {
+                message.textContent = "This browser does not support GPS location.";
+                return;
+            }
+
+            if (watchId !== null) {
+                navigator.geolocation.clearWatch(watchId);
+                watchId = null;
+                message.textContent = "GPS tracking stopped.";
+                return;
+            }
+
+            watchId = navigator.geolocation.watchPosition(
+                sendLocation,
+                error => {
+                    message.textContent = `GPS error: ${error.message}`;
+                },
+                { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 }
+            );
+
+            message.textContent = "Waiting for location permission…";
+            document.getElementById("gpsButton").textContent = "Stop GPS";
+        });
+    document.getElementById("simulateButton").addEventListener("click", async () => {
+        const button = document.getElementById("simulateButton");
+        const caseId = caseIdInput.value.trim();
+
+        if (simulationTimer) {
+            clearInterval(simulationTimer);
+            simulationTimer = null;
+            button.textContent = "Start demo movement";
+            message.textContent = "Demo movement stopped.";
+            return;
+        }
+
+        if (simulationPoints.length === 0) {
+            message.textContent = "Click Refresh traffic route first.";
+            return;
+        }
+
+        // Stop real GPS so it does not override the simulated positions.
+        if (watchId !== null) {
+            navigator.geolocation.clearWatch(watchId);
+            watchId = null;
+            document.getElementById("gpsButton").textContent = "Start GPS";
+        }
+
+        simulationIndex = 0;
+        await updateCaseStatus("en_route");
+        button.textContent = "Stop demo movement";
+
+        simulationTimer = setInterval(async () => {
+            const [latitude, longitude] = simulationPoints[simulationIndex];
+
+            if (ambulanceMarker) {
+                ambulanceMarker.setLatLng([latitude, longitude]);
+            } else {
+                ambulanceMarker = L.marker([latitude, longitude])
+                    .addTo(map)
+                    .bindPopup("Simulated ambulance");
+            }
+
+            map.panTo([latitude, longitude]);
+
+            try {
+                const response = await fetch(
+                    `/api/cases/${encodeURIComponent(caseId)}/location`,
+                    {
+                        method: "PATCH",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ latitude, longitude })
+                    }
+                );
+
+                const result = await response.json();
+                if (!response.ok) {
+                    throw new Error(result.error || "Could not update location");
+                }
+
+                message.textContent =
+                    `Demo movement: ${simulationIndex + 1} of ${simulationPoints.length}`;
+            } catch (error) {
+                message.textContent = error.message;
+                clearInterval(simulationTimer);
+                simulationTimer = null;
+                button.textContent = "Start demo movement";
+                return;
+            }
+
+            simulationIndex++;
+
+            if (simulationIndex >= simulationPoints.length) {
+                clearInterval(simulationTimer);
+                simulationTimer = null;
+                button.textContent = "Start demo movement";
+
+                const finalStatus =
+                    document.getElementById("destination").value === "scene"
+                        ? "at_scene"
+                        : "arrived";
+
+                try {
+                    await updateCaseStatus(finalStatus);
+                    message.textContent = "Demo ambulance reached the destination.";
+                } catch (error) {
+                    message.textContent = error.message;
+                }
+            }
+        }, 2500);
+    });
+        document.getElementById("routeButton")
+            .addEventListener("click", refreshRoute);
+    </script>
+</body>
+
+</html>
