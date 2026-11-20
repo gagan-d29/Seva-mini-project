@@ -1,0 +1,661 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>SEVA - Ambulance Tracking</title>
+
+<link rel="stylesheet"
+href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+
+<style>
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    font-family: Arial, sans-serif;
+    background: #f4f6f9;
+}
+
+#top {
+    padding: 15px;
+    background: #b71c1c;
+    color: white;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+#map {
+    width: 100%;
+    height: 60vh;
+}
+
+#info {
+    padding: 12px;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 10px;
+}
+
+.card {
+    background: white;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    padding: 12px;
+}
+
+button {
+    padding: 9px 13px;
+    margin: 3px;
+    border: none;
+    border-radius: 5px;
+    background: #b71c1c;
+    color: white;
+    cursor: pointer;
+}
+
+button:hover {
+    background: #8e0000;
+}
+
+input {
+    padding: 5px;
+}
+
+small {
+    color: #666;
+}
+
+@media(max-width:600px) {
+    #map {
+        height: 50vh;
+    }
+}
+
+</style>
+</head>
+
+<body>
+
+<div id="top">
+
+    <b>SEVA Ambulance Dashboard</b>
+
+    <span>
+        Ambulance ID:
+        <input id="amb" value="AMB-01" size="8">
+    </span>
+
+    <button onclick="start()">Load Case & Start</button>
+
+    <label>
+        <input type="checkbox" id="sim">
+        Simulate GPS
+    </label>
+
+    <span id="stat">Idle</span>
+
+</div>
+
+<div id="map"></div>
+
+<div id="info">
+
+    <div class="card">
+        <b>Patient Case Details</b>
+        <div id="case">Waiting for case...</div>
+    </div>
+
+    <div class="card">
+        <b>Route and ETA</b>
+        <div id="eta">Waiting for route...</div>
+        <small>Traffic and signal priority are simulated.</small>
+    </div>
+
+    <div class="card">
+        <b>Update Ambulance Status</b>
+
+        <div>
+            <button onclick="setStatus('en_route')">
+                En Route
+            </button>
+
+            <button onclick="setStatus('picked_up')">
+                Patient Picked Up
+            </button>
+
+            <button onclick="setStatus('arrived_hospital')">
+                Arrived Hospital
+            </button>
+        </div>
+    </div>
+
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<script>
+
+// ================= API CONFIGURATION =================
+
+const API = "http://localhost:5000/api";
+
+const ROUTES = {
+    ambulance: id => `${API}/ambulances/${id}`,
+    caseGet: id => `${API}/cases/${id}`,
+    location: id => `${API}/ambulances/${id}/location`,
+    status: id => `${API}/cases/${id}/status`
+};
+
+const POLL_MS = 5000;
+const SEND_MS = 3000;
+const ROUTE_UPDATE_MS = 15000;
+
+
+// ================= MAP INITIALIZATION =================
+
+const map = L.map('map').setView([12.87, 74.84], 12);
+
+L.tileLayer(
+    'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+    {
+        attribution: '© OpenStreetMap'
+    }
+).addTo(map);
+
+
+// ================= VARIABLES =================
+
+const $ = id => document.getElementById(id);
+
+let amb = null;
+let cs = null;
+let pos = null;
+
+let ambMk = null;
+let patMk = null;
+let hosMk = null;
+let routeLn = null;
+
+let path = [];
+let pi = 0;
+
+let timers = [];
+let gpsWatch = null;
+
+let lastRouteUpdate = 0;
+let loading = false;
+
+
+// ================= API REQUEST =================
+
+async function j(url, opt) {
+
+    const response = await fetch(url, opt);
+
+    if (!response.ok) {
+        throw new Error("HTTP " + response.status);
+    }
+
+    return response.json();
+}
+
+
+// ================= MAP MARKERS =================
+
+function put(marker, location, title) {
+
+    if (marker) {
+
+        marker.setLatLng(location);
+
+    } else {
+
+        marker = L.marker(location).addTo(map);
+
+    }
+
+    marker.bindTooltip(title);
+
+    return marker;
+}
+
+
+// ================= START DASHBOARD =================
+
+async function start() {
+
+    amb = $('amb').value.trim();
+
+    if (!amb) {
+        alert("Enter ambulance ID");
+        return;
+    }
+
+    // Stop previous tracking
+
+    timers.forEach(timer => clearInterval(timer));
+    timers = [];
+
+    if (gpsWatch !== null) {
+
+        navigator.geolocation.clearWatch(gpsWatch);
+        gpsWatch = null;
+
+    }
+
+    pos = null;
+    path = [];
+    pi = 0;
+    lastRouteUpdate = 0;
+
+    $('stat').textContent = "Connecting...";
+
+    await loadCase();
+
+    timers.push(
+        setInterval(loadCase, POLL_MS)
+    );
+
+    // REAL GPS TRACKING
+
+    if (!$('sim').checked) {
+
+        if (!navigator.geolocation) {
+
+            $('stat').textContent = "GPS not supported";
+            return;
+
+        }
+
+        $('stat').textContent = "Waiting for GPS...";
+
+        gpsWatch = navigator.geolocation.watchPosition(
+
+            function (p) {
+
+                const lat = p.coords.latitude;
+                const lng = p.coords.longitude;
+
+                sendPos(lat, lng);
+
+                $('stat').textContent =
+                    "Real GPS Active | Accuracy: " +
+                    Math.round(p.coords.accuracy) + " m";
+
+            },
+
+            function (error) {
+
+                $('stat').textContent =
+                    "GPS Error: " + error.message;
+
+            },
+
+            {
+                enableHighAccuracy: true,
+                maximumAge: 5000,
+                timeout: 15000
+            }
+
+        );
+
+    }
+
+    // SIMULATED GPS TRACKING
+
+    else {
+
+        $('stat').textContent = "Simulation Active";
+
+        timers.push(
+            setInterval(simStep, SEND_MS)
+        );
+
+    }
+
+}
+
+
+// ================= LOAD CASE =================
+
+async function loadCase() {
+
+    if (loading) return;
+
+    loading = true;
+
+    try {
+
+        const a = await j(
+            ROUTES.ambulance(amb)
+        );
+
+        if (!a.assigned_case_id) {
+
+            $('stat').textContent = "Waiting for case";
+
+            return;
+
+        }
+
+        const c = await j(
+            ROUTES.caseGet(a.assigned_case_id)
+        );
+
+        const caseChanged =
+            !cs ||
+            cs.case_id !== c.case_id ||
+            cs.status !== c.status;
+
+        cs = c;
+
+        if (!pos && a.location) {
+
+            pos = [
+                a.location.lat,
+                a.location.lng
+            ];
+
+        }
+
+        if (!pos) {
+
+            pos = [
+                c.location.lat + 0.02,
+                c.location.lng + 0.02
+            ];
+
+        }
+
+        $('case').innerHTML =
+
+            `Case ID: ${c.case_id}<br>
+             Patient: ${c.patient_name || ''}<br>
+             Symptoms: ${c.symptoms || ''}<br>
+             Severity: ${c.severity || '-'}<br>
+             Status: <b>${c.status}</b><br>
+             Location: ${c.location.address || ''}`;
+
+        // Patient marker
+
+        patMk = put(
+            patMk,
+            [c.location.lat, c.location.lng],
+            'Patient'
+        );
+
+        // Hospital marker
+
+        if (c.hospital) {
+
+            hosMk = put(
+                hosMk,
+                [c.hospital.lat, c.hospital.lng],
+                'Hospital: ' + c.hospital.name
+            );
+
+        }
+
+        // Ambulance marker
+
+        ambMk = put(
+            ambMk,
+            pos,
+            'Ambulance'
+        );
+
+        // Draw route when case or status changes
+
+        if (caseChanged) {
+
+            await drawRoute();
+
+        }
+
+        $('stat').textContent =
+            $('sim').checked
+            ? "Simulation Active"
+            : "Real GPS Active";
+
+    }
+
+    catch (e) {
+
+        $('stat').textContent =
+            "API Error: " + e.message;
+
+    }
+
+    finally {
+
+        loading = false;
+
+    }
+
+}
+
+
+// ================= DRAW ROAD ROUTE =================
+
+async function drawRoute() {
+
+    if (!cs || !pos) return;
+
+    const toHospital =
+        ['picked_up', 'arrived_hospital'].includes(cs.status)
+        && cs.hospital;
+
+    const destination = toHospital
+
+        ? [cs.hospital.lat, cs.hospital.lng]
+
+        : [cs.location.lat, cs.location.lng];
+
+    const url =
+
+        `https://router.project-osrm.org/route/v1/driving/` +
+        `${pos[1]},${pos[0]};${destination[1]},${destination[0]}` +
+        `?overview=full&geometries=geojson`;
+
+    try {
+
+        const data = await j(url);
+
+        if (!data.routes || !data.routes.length) {
+
+            throw new Error("No route found");
+
+        }
+
+        const r = data.routes[0];
+
+        path = r.geometry.coordinates.map(
+            c => [c[1], c[0]]
+        );
+
+        pi = 0;
+
+        if (routeLn) {
+
+            map.removeLayer(routeLn);
+
+        }
+
+        routeLn = L.polyline(
+            path,
+            {
+                color: 'red',
+                weight: 5
+            }
+        ).addTo(map);
+
+        map.fitBounds(routeLn.getBounds());
+
+        const km = (
+            r.distance / 1000
+        ).toFixed(1);
+
+        const minutes = Math.max(
+            1,
+            Math.round(r.duration / 60)
+        );
+
+        $('eta').innerHTML =
+
+            `${km} km<br>
+             ETA: Approximately ${minutes} minutes<br>
+             <small>Road estimate: ${minutes} minutes</small>`;
+
+    }
+
+    catch (e) {
+
+        $('eta').textContent =
+            "Routing failed: " + e.message;
+
+    }
+
+}
+
+
+// ================= SIMULATE GPS =================
+
+function simStep() {
+
+    if (!path.length) return;
+
+    pi = Math.min(
+        pi + 3,
+        path.length - 1
+    );
+
+    const point = path[pi];
+
+    sendPos(point[0], point[1]);
+
+}
+
+
+// ================= SEND GPS LOCATION =================
+
+async function sendPos(lat, lng) {
+
+    pos = [lat, lng];
+
+    ambMk = put(
+        ambMk,
+        pos,
+        'Ambulance'
+    );
+
+    try {
+
+        await j(
+            ROUTES.location(amb),
+            {
+                method: 'POST',
+
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+
+                body: JSON.stringify({
+
+                    lat: lat,
+                    lng: lng,
+
+                    timestamp: new Date().toISOString(),
+
+                    case_id: cs ? cs.case_id : null
+
+                })
+
+            }
+        );
+
+        // AUTOMATIC ROUTE AND ETA UPDATE
+
+        if (
+            cs &&
+            Date.now() - lastRouteUpdate >= ROUTE_UPDATE_MS
+        ) {
+
+            lastRouteUpdate = Date.now();
+
+            drawRoute();
+
+        }
+
+    }
+
+    catch (e) {
+
+        $('stat').textContent =
+            "Location send failed: " + e.message;
+
+    }
+
+}
+
+
+// ================= UPDATE CASE STATUS =================
+
+async function setStatus(status) {
+
+    if (!cs) {
+
+        alert("Load a case first");
+
+        return;
+
+    }
+
+    try {
+
+        await j(
+            ROUTES.status(cs.case_id),
+            {
+                method: 'PATCH',
+
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+
+                body: JSON.stringify({
+
+                    status: status
+
+                })
+
+            }
+        );
+
+        cs.status = status;
+
+        await loadCase();
+
+        await drawRoute();
+
+    }
+
+    catch (e) {
+
+        $('stat').textContent =
+            "Status update failed: " + e.message;
+
+    }
+
+}
+
+</script>
+
+</body>
+</html>
